@@ -2,9 +2,45 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import sklearn
+from sklearn import svm
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score
+from bracketeer import build_bracket
+from eli5.sklearn import PermutationImportance
+
 import csv
 
-from helpers import tourney_round
+from helpers import tourney_round, get_year_team1_team2
+
+def predict_poss_matches(clf, df_predict, df_features):
+    diff = []
+    data = []
+
+    for i, row in df_predict.iterrows():
+
+        year, team1, team2 = get_year_team1_team2(row.ID)
+
+        # Save 2018 stats/features for the first ID:
+        team1 = df_features[(df_features['Season'] == year) & (df_features['TeamID'] == team1)].values[0]
+
+        # Save 2018 stats/features for the first ID:
+        team2 = df_features[(df_features['Season'] == year) & (df_features['TeamID'] == team2)].values[0]   
+
+        diff = team1 - team2
+
+        data.append(diff)
+
+    n_poss_games = len(df_predict)
+    columns = df_features.columns.get_values()
+    final_predictions = pd.DataFrame(np.array(data).reshape(n_poss_games, np.array(data).shape[1]), columns=(columns))
+    final_predictions.drop(['Season', 'TeamID'], inplace=True, axis=1)
+    predictions = clf.predict_proba(final_predictions)[:, 1]
+    clipped_predictions = np.clip(predictions, 0.05, 0.95)
+    df_predict.Pred = clipped_predictions
+    
+    return df_predict
+
 
 # Clean NCAA Tournament Seed Data
 df_seeds = pd.read_csv('./csv_data/NCAATourneySeeds.csv')
@@ -165,7 +201,6 @@ df_avgs['stl_pct'] = df_avgs['Wstl_pct'] * df_avgs['win_pct'] + df_avgs['Lstl_pc
 df_avgs.reset_index(inplace = True)
 df_avgs = df_avgs.rename(columns={'WTeamID': 'TeamID', 'WTeamName': 'TeamName', 'WConfName': 'ConfName'})
 df_regular_season = df
-print(df_regular_season.head())
 
 # Add Tournament Round Data to the Tourney dataframe
 df_tourney['tourn_round'] = df_tourney.DayNum.apply(tourney_round)
@@ -181,8 +216,74 @@ df_tourney = df_tourney.merge(df_seeds, how='left', left_on=['Season', 'WTeamID'
 
 df_tourney['point_diff'] = df_tourney.WScore - df_tourney.LScore
 
-df_upsets = df_tourney[df_tourney.Wseed > df_tourney.Lseed]
 
-upset_count = df_upsets.groupby(['Season'], as_index=False).Wseed.count().rename(columns={'Wseed': 'upset_count'})
+# Build Features
+df_features = df_avgs[['Season', 'TeamID', 'shoot_eff', 'score_op', 'off_rtg', 'def_rtg', 'sos', 'ie', 'efg_pct', 'to_poss', 'orb_pct', 'ft_rate', 'reb_pct', 'drb_pct', 'ts_pct', 'ast_rtio', 'blk_pct', 'stl_pct']]
 
-print(upset_count.head())
+
+# Data Modeling
+
+df_features = pd.merge(df_seeds, df_features, how='left', left_on=['Season', 'TeamID'], right_on=['Season', 'TeamID'])
+
+df_tourney = df_tourney[(df_tourney.Season >= 2003) & (df_tourney.Season < 2018)]
+df_tourney.reset_index(inplace=True, drop=True)
+
+# Merge tourney games with tourney winners' season features:
+df_winners = pd.merge(left=df_tourney[['Season', 'WTeamID', 'LTeamID']], right=df_features, how='left', left_on=['Season', 'WTeamID'], right_on=['Season', 'TeamID'])
+df_winners.drop(['TeamID'], inplace=True, axis=1)
+# Merge tourney games with loser features:
+df_losers = pd.merge(left=df_tourney[['Season', 'WTeamID', 'LTeamID']], right=df_features, how='left', left_on=['Season', 'LTeamID'], right_on=['Season', 'TeamID'])
+df_losers.drop(['TeamID'], inplace=True, axis=1)
+
+# Create winner target by subtracting loser data from winner data,
+# and assigning a value of 1:
+df_winner_diff = (df_winners.iloc[:, 3:] - df_losers.iloc[:, 3:])
+df_winner_diff['result'] = 1
+
+# Create loser target by subtracting winner data from loser data,
+# and assigning a value of 0:
+df_loser_diff = (df_losers.iloc[:, 3:] - df_winners.iloc[:, 3:])
+df_loser_diff['result'] = 0
+
+# Concatenate winner data with loser data:
+df_model = pd.concat((df_winner_diff, df_loser_diff), axis=0)
+# df_model.head()
+
+
+X = df_model.iloc[:, :-1]
+y = df_model.result
+
+# Split the dataframe into 65% training and 35% testing:
+train_inputs, test_inputs, train_labels, test_labels = train_test_split(X, y, test_size=0.35, random_state=32)
+
+
+clf = svm.SVC(C=10.0,gamma=.0001, probability=True)
+svm_param_grid = {
+    'clf__C': np.logspace(start=-3, stop=3, num=7), 
+    'clf__gamma': np.logspace(start=-4, stop=-1, num=4)
+}
+clf.fit(train_inputs,train_labels)
+res = clf.predict(test_inputs)
+print(accuracy_score(test_labels,res))
+
+df_predict = pd.read_csv('./csv_data/SampleSubmissionStage2.csv')
+
+# Create pipeline for scaling and classifying:
+pipe = Pipeline([('clf', clf)])
+
+lr_search = GridSearchCV(pipe, svm_param_grid, cv=10)
+lr_search.fit(train_inputs, train_labels)
+print(lr_search.best_params_)
+
+perm = PermutationImportance(lr_search, random_state=1).fit(test_inputs, test_labels)
+
+predict_poss_matches(lr_search, df_predict, df_features).to_csv('best_model_results2.csv', index=False)
+
+b = build_bracket(
+        outputPath='best_bracket.png',
+        submissionPath='best_model_results2.csv',
+        teamsPath='./csv_data/Teams.csv',
+        seedsPath='./csv_data/NCAATourneySeeds.csv',
+        slotsPath='./csv_data/NCAATourneySlots.csv',
+        year=2019
+)

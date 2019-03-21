@@ -16,3 +16,10 @@ def tourney_round(DayNum):
         return 2
     else:
         return 68
+
+
+def get_year_team1_team2(ID):
+    """Return a tuple with the year, team1 and team2
+    for each ID in the sample submission file of possible matches."""
+    return (int(x) for x in ID.split('_'))
+
